@@ -33,4 +33,4 @@ docker-compose up --build -d
 🚫 .gitignore
 📜 LICENSE - proprietary
 📊 prometheus.yml
-© 2026 A.S.A.S. CLOUD ☁️🔒 Tüm hakları saklıdır
+© 2026 A.S.A.S. CLOUD ☁️🔒 Tüm hakları saklıdır 
