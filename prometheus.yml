@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+    - job_name: 'asas-pay'
+    static_configs:
+            - targets: ['pay:3000']
+    metrics_path: '/metrics'
