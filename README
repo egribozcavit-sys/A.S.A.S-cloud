@@ -1,0 +1,14 @@
+# A.S.A.S. PAY v4 - INTERNATIONAL STRONGEST
+
+Üst düzey mimari + üst düzey güvenlik
+- Argon2id / bcrypt hash, 200k iter
+- JWT + jti revoke + refresh rotation
+- Redis + in-memory rate limit
+- Idempotency key, balance_after, group_reference
+- Prometheus metrics, health, ready
+
+Kurulum:
+cp .env.example .env
+docker-compose up --build -d
+curl http://localhost:3000/health
+curl http://localhost:3000/docs
