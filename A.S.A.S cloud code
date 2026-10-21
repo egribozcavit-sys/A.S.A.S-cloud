@@ -194,4 +194,4 @@ def ready():
 @app.post("/api/v1/cloud/nodes", status_code=201)
 def create_node(payload: NodeCreate, cu: Annotated[User, Depends(current_user)], db: Annotated[Session, Depends(get_db)]):
     node=CloudNode(tenant_id=cu.tenant_id, name=payload.name.lower(), type=payload.type, region=payload.region, cpu_cores=payload.cpu_cores, ram_gb=payload.ram_gb, config=json.dumps(payload.config) if payload.config else None)
-    db.add(node); db.commit(); db.refresh(node); return node
+    db.add(node); db.commit(); db.refresh(node); return node 
