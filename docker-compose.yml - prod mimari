@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-asas_pay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?prod sifre zorunlu}
+      POSTGRES_DB: ${POSTGRES_DB:-asas_pay}
+    volumes:
+            - pgdata:/var/lib/postgresql/data
+    ports: ["5432:5432"]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U ${POSTGRES_USER:-asas_pay}"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD:?redis sifre zorunlu} --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes: [redisdata:/data]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+
+  pay:
+    build: .
+    env_file: .env
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+    ports: ["3000:3000"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    deploy:
+      resources:
+        limits: {cpus: '2', memory: 1G}
+
+  prometheus:
+    image: prom/prometheus:v2.53.2
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml"]
+    ports: ["9090:9090"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
