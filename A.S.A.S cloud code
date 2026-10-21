@@ -279,4 +279,4 @@ def _watcher_loop():
 
 @app.on_event("startup")
 def start_watcher():
-    t=threading.Thread(target=_watcher_loop, daemon=True); t.start()
+    t=threading.Thread(target=_watcher_loop, daemon=True); t.start() 
