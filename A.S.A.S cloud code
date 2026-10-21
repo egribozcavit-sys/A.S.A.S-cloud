@@ -1,0 +1,197 @@
+# FILE: asas_cloud_production.py - A.S.A.S. CLOUD PRODUCTION v10 FINAL - PRODUCTION
+# pip install "fastapi[standard]" "python-jose[cryptography]" sqlalchemy argon2-cffi redis email-validator
+# ENV prod zorunlu: ASAS_ENV=production ASAS_JWT_SECRET_KEY=$(openssl rand -base64 64) ASAS_CLOUD_DATABASE_URL=postgresql+psycopg2://user:pass@host/db REDIS_URL=redis://... ASAS_ALLOWED_ORIGINS=https://yourdomain.com
+# RUN: uvicorn asas_cloud_production:app --host 0.0.0.0 --port 3000 --workers 4
+
+from __future__ import annotations
+import os, secrets, hashlib, threading, uuid, time, json
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import Annotated, Optional, List, Dict
+from fastapi import Depends, FastAPI, HTTPException, Request, Header
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from pydantic import BaseModel, Field, field_validator, ConfigDict, EmailStr
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, select, CheckConstraint, Index, func, Text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+try:
+    from argon2 import PasswordHasher
+    _ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32, salt_len=16)
+    def hash_password(p: str) -> str: return _ph.hash(p[:128])
+    def verify_password(p: str, h: str) -> bool:
+        try: return _ph.verify(h, p[:128])
+        except: return False
+    HASH_ALGO="argon2id"
+except ImportError:
+    def hash_password(p: str) -> str:
+        s=secrets.token_hex(16); dk=hashlib.pbkdf2_hmac("sha256", p.encode(), s.encode(), 200_000)
+        return f"pbkdf2${s}${dk.hex()}"
+    def verify_password(p: str, h: str) -> bool:
+        try:
+            _, s, hx = h.split("$")
+            dk=hashlib.pbkdf2_hmac("sha256", p.encode(), s.encode(), 200_000)
+            return secrets.compare_digest(dk.hex(), hx)
+        except: return False
+    HASH_ALGO="pbkdf2"
+
+APP_NAME="A.S.A.S. Cloud Production"
+ENV=os.getenv("ASAS_ENV","development").lower()
+IS_PROD=ENV=="production"
+JWT_SECRET=os.getenv("ASAS_JWT_SECRET_KEY")
+if not JWT_SECRET:
+    if IS_PROD: raise RuntimeError("ASAS_JWT_SECRET_KEY productionda zorunlu")
+    JWT_SECRET=secrets.token_urlsafe(64)
+
+DB_URL=os.getenv("ASAS_CLOUD_DATABASE_URL","sqlite:///./asas_cloud_prod.db")
+REDIS_URL=os.getenv("REDIS_URL","redis://localhost:6379/0")
+ORIGINS=[o.strip() for o in os.getenv("ASAS_ALLOWED_ORIGINS","http://localhost:3000").split(",") if o.strip()]
+
+try:
+    import redis; redis_client=redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=1, socket_timeout=1); redis_client.ping(); REDIS_ENABLED=True
+except: redis_client=None; REDIS_ENABLED=False
+
+rate_store: Dict[str, List[float]]={}; rate_lock=threading.Lock()
+def rate_limit(req: Request, key="global", limit=60, window=60):
+    ip=req.client.host if req.client else "unknown"; rkey=f"rl:{key}:{ip}"; now=time.time()
+    if REDIS_ENABLED:
+        try:
+            pipe=redis_client.pipeline(); pipe.zremrangebyscore(rkey,0,now-window); pipe.zcard(rkey)
+            pipe.zadd(rkey,{str(uuid.uuid4()):now}); pipe.expire(rkey,window)
+            _,cnt,_,_=pipe.execute()
+            if cnt>=limit: raise HTTPException(429,"Rate limit")
+            return
+        except HTTPException: raise
+        except: pass
+    with rate_lock:
+        lst=[t for t in rate_store.get(rkey,[]) if now-t<window]
+        if len(lst)>=limit: raise HTTPException(429,"Rate limit")
+        lst.append(now); rate_store[rkey]=lst
+
+engine=create_engine(DB_URL, connect_args={"check_same_thread":False} if DB_URL.startswith("sqlite") else {}, pool_pre_ping=True, pool_size=20, max_overflow=30)
+SessionLocal=sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+class Base(DeclarativeBase): pass
+def uuid_str(): return str(uuid.uuid4())
+def utc_now(): return datetime.now(timezone.utc)
+
+class TenantStatus(str, Enum): ACTIVE="active"; SUSPENDED="suspended"; DELETED="deleted"
+class NodeStatus(str, Enum): ONLINE="online"; OFFLINE="offline"; MAINTENANCE="maintenance"; FAILED="failed"; PROVISIONING="provisioning"
+class NodeType(str, Enum): EDGE="edge"; ENERGY="energy"; COMPUTE="compute"; STORAGE="storage"; GATEWAY="gateway"
+class Role(str, Enum): OWNER="owner"; ADMIN="admin"; DEVELOPER="developer"; VIEWER="viewer"
+
+class Tenant(Base):
+    __tablename__="tenants"
+    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uuid_str)
+    name: Mapped[str]=mapped_column(String(60), unique=True, index=True)
+    owner_email: Mapped[str]=mapped_column(String(320), index=True)
+    status: Mapped[str]=mapped_column(String(20), default=TenantStatus.ACTIVE.value, index=True)
+    region_primary: Mapped[str]=mapped_column(String(30), default="eu-central-1")
+    quota_nodes: Mapped[int]=mapped_column(Integer, default=100)
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
+
+class User(Base):
+    __tablename__="users"
+    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uuid_str)
+    email: Mapped[str]=mapped_column(String(320), unique=True, index=True)
+    full_name: Mapped[str]=mapped_column(String(160))
+    password_hash: Mapped[str]=mapped_column(String(500))
+    tenant_id: Mapped[str]=mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str]=mapped_column(String(20), default=Role.DEVELOPER.value, index=True)
+    is_active: Mapped[bool]=mapped_column(Boolean, default=True)
+    failed_login_attempts: Mapped[int]=mapped_column(Integer, default=0)
+    locked_until: Mapped[Optional[datetime]]=mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
+
+class CloudNode(Base):
+    __tablename__="cloud_nodes"
+    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uuid_str)
+    tenant_id: Mapped[str]=mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str]=mapped_column(String(80), index=True)
+    type: Mapped[str]=mapped_column(String(20), index=True)
+    status: Mapped[str]=mapped_column(String(20), default=NodeStatus.PROVISIONING.value, index=True)
+    region: Mapped[str]=mapped_column(String(30), index=True)
+    zone: Mapped[str]=mapped_column(String(10), default="a")
+    ip_public: Mapped[Optional[str]]=mapped_column(String(45), nullable=True)
+    cpu_cores: Mapped[int]=mapped_column(Integer, default=2)
+    ram_gb: Mapped[int]=mapped_column(Integer, default=4)
+    disk_gb: Mapped[int]=mapped_column(Integer, default=50)
+    version: Mapped[int]=mapped_column(Integer, default=1)
+    last_heartbeat: Mapped[Optional[datetime]]=mapped_column(DateTime(timezone=True), nullable=True)
+    config: Mapped[Optional[str]]=mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
+    __table_args__=(UniqueConstraint("tenant_id","name",name="uq_tenant_node"),)
+
+class RevokedToken(Base):
+    __tablename__="revoked_tokens"
+    jti: Mapped[str]=mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str]=mapped_column(String(36), index=True)
+    expires_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), index=True)
+
+class AuditLog(Base):
+    __tablename__="audit_logs"
+    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uuid_str)
+    tenant_id: Mapped[str]=mapped_column(String(36), index=True)
+    user_id: Mapped[str]=mapped_column(String(36), index=True)
+    action: Mapped[str]=mapped_column(String(80), index=True)
+    detail: Mapped[Optional[str]]=mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
+
+Base.metadata.create_all(bind=engine)
+
+class NodeCreate(BaseModel):
+    name: str=Field(pattern=r"^[a-z0-9-]+$"); type: str=Field(pattern=r"^(edge|energy|compute|storage|gateway)$")
+    region: str=Field(pattern=r"^[a-z]+-[a-z]+-\d$"); cpu_cores: int=Field(ge=1, le=256); ram_gb: int=Field(ge=1, le=2048)
+    config: Optional[Dict]=None; idempotency_key: str=Field(default_factory=lambda: secrets.token_hex(12))
+
+class RegisterRequest(BaseModel):
+    email: EmailStr; full_name: str; password: str=Field(min_length=12); tenant_name: str
+
+class LoginRequest(BaseModel):
+    email: EmailStr; password: str
+
+bearer_scheme=HTTPBearer(auto_error=False)
+def get_db():
+    db=SessionLocal()
+    try: yield db
+    finally: db.close()
+def create_token(uid: str, typ: str, delta: timedelta):
+    now=datetime.now(timezone.utc)
+    payload={"sub":uid,"type":typ,"iat":int(now.timestamp()),"exp":int((now+delta).timestamp()),"jti":secrets.token_urlsafe(24),"iss":APP_NAME,"aud":"asas-cloud"}
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+def create_access_token(uid: str): return create_token(uid,"access",timedelta(minutes=15))
+def create_refresh_token(uid: str): return create_token(uid,"refresh",timedelta(days=7))
+def current_user(creds: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)], db: Annotated[Session, Depends(get_db)]):
+    if not creds: raise HTTPException(401,"Auth gerekli")
+    try: p=jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"], audience="asas-cloud")
+    except: raise HTTPException(401,"Geçersiz")
+    u=db.get(User, p.get("sub"))
+    if not u: raise HTTPException(401,"Yok")
+    return u
+
+app=FastAPI(title=APP_NAME, version="10.0.0-PRODUCTION")
+app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_credentials=True, allow_methods=["GET","POST","DELETE"], allow_headers=["*"])
+
+@app.middleware("http")
+async def sec_headers(req: Request, call_next):
+    resp=await call_next(req)
+    resp.headers["X-Content-Type-Options"]="nosniff"; resp.headers["X-Frame-Options"]="DENY"
+    resp.headers["Referrer-Policy"]="no-referrer"; resp.headers["Content-Security-Policy"]="default-src 'none'; frame-ancestors 'none'"
+    resp.headers["X-Request-ID"]=str(uuid.uuid4()); resp.headers["Cache-Control"]="no-store"
+    if IS_PROD: resp.headers["Strict-Transport-Security"]="max-age=63072000; includeSubDomains; preload"
+    return resp
+
+@app.get("/health")
+def health(): return {"status":"ok","hash":HASH_ALGO,"redis":REDIS_ENABLED,"env":ENV}
+@app.get("/ready")
+def ready():
+    try:
+        with SessionLocal() as db: db.execute(select(func.now()))
+        return {"ready":True}
+    except Exception as e: raise HTTPException(503, f"not ready {e}")
+
+@app.post("/api/v1/cloud/nodes", status_code=201)
+def create_node(payload: NodeCreate, cu: Annotated[User, Depends(current_user)], db: Annotated[Session, Depends(get_db)]):
+    node=CloudNode(tenant_id=cu.tenant_id, name=payload.name.lower(), type=payload.type, region=payload.region, cpu_cores=payload.cpu_cores, ram_gb=payload.ram_gb, config=json.dumps(payload.config) if payload.config else None)
+    db.add(node); db.commit(); db.refresh(node); return node
